@@ -5,7 +5,7 @@ use std::{
     mem::size_of_val,
     os::windows::prelude::OwnedHandle,
     ptr::null_mut,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -128,6 +128,7 @@ impl WindowsDevice {
         Ok(Arc::new(WindowsInterface {
             handle,
             winusb_handle,
+            raw_io: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -142,6 +143,7 @@ impl WindowsDevice {
 pub(crate) struct WindowsInterface {
     pub(crate) handle: OwnedHandle,
     pub(crate) winusb_handle: WINUSB_INTERFACE_HANDLE,
+    pub(crate) raw_io: Mutex<HashMap<u8, usize>>,
 }
 
 impl WindowsInterface {

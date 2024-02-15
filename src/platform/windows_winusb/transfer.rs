@@ -1,7 +1,8 @@
 use std::{
+    collections::hash_map::Entry,
     ffi::c_void,
     io,
-    mem::{self, ManuallyDrop},
+    mem::{self, size_of_val, ManuallyDrop},
     ptr::{addr_of_mut, null_mut},
     sync::Arc,
 };
@@ -9,8 +10,8 @@ use std::{
 use log::{debug, error};
 use windows_sys::Win32::{
     Devices::Usb::{
-        WinUsb_ControlTransfer, WinUsb_GetOverlappedResult, WinUsb_ReadPipe, WinUsb_WritePipe,
-        WINUSB_SETUP_PACKET,
+        WinUsb_ControlTransfer, WinUsb_GetOverlappedResult, WinUsb_GetPipePolicy, WinUsb_ReadPipe,
+        WinUsb_SetPipePolicy, WinUsb_WritePipe, MAXIMUM_TRANSFER_SIZE, RAW_IO, WINUSB_SETUP_PACKET,
     },
     Foundation::{
         GetLastError, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE,
@@ -126,6 +127,59 @@ impl TransferData {
 
         (actual_len as usize, status)
     }
+
+    fn setup_raw_io(&mut self) -> Option<usize> {
+        use EndpointType::*;
+        use Entry::*;
+        match self.ep_type {
+            Bulk | Interrupt if (self.endpoint & 0x80) != 0 => {
+                match self
+                    .interface
+                    .raw_io
+                    .lock()
+                    .expect("RAW_IO state lock poisoned")
+                    .entry(self.endpoint)
+                {
+                    Occupied(entry) => Some(*entry.get()),
+                    Vacant(entry) => unsafe {
+                        let mut max_transfer_size = 0u32;
+                        let mut policy_size = size_of_val(&max_transfer_size) as u32;
+                        let r = WinUsb_GetPipePolicy(
+                            self.interface.winusb_handle,
+                            self.endpoint,
+                            MAXIMUM_TRANSFER_SIZE,
+                            &mut policy_size as *mut u32,
+                            &mut max_transfer_size as *mut u32 as *mut c_void,
+                        );
+                        if r != TRUE {
+                            error!(
+                                "WinUsb_GetPipePolicy MAXIMUM_TRANSFER_SIZE failed: {}",
+                                io::Error::last_os_error()
+                            );
+                            return None;
+                        }
+                        let r = WinUsb_SetPipePolicy(
+                            self.interface.winusb_handle,
+                            self.endpoint,
+                            RAW_IO,
+                            size_of_val(&TRUE) as u32,
+                            &TRUE as *const i32 as *const c_void,
+                        );
+                        if r != TRUE {
+                            error!(
+                                "WinUsb_SetPipePolicy RAW_IO failed: {}",
+                                io::Error::last_os_error()
+                            );
+                            return None;
+                        }
+                        entry.insert(max_transfer_size as usize);
+                        Some(max_transfer_size as usize)
+                    },
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Drop for TransferData {
@@ -203,6 +257,8 @@ impl PlatformSubmit<RequestBuffer> for TransferData {
             "Submit transfer {:?} on endpoint {:02X} for {} bytes IN",
             self.event, self.endpoint, request_len
         );
+
+        self.setup_raw_io();
 
         let r = WinUsb_ReadPipe(
             self.interface.winusb_handle,
